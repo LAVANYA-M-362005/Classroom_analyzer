@@ -9,18 +9,39 @@ const WebcamStream = ({ wsRef, onFrame }) => {
 
   useEffect(() => {
     let interval;
+    let audioContext;
+    let analyser;
+    let micStream;
+    let dataArray;
 
     const startWebcam = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.onloadedmetadata = () => setCamReady(true);
+        }
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+          audioContext = new AudioContext();
+          micStream = audioContext.createMediaStreamSource(stream);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          dataArray = new Uint8Array(analyser.frequencyBinCount);
+          micStream.connect(analyser);
         }
       } catch (err) {
         console.error('Camera error:', err);
         setCamError(true);
       }
+    };
+
+    const getAudioLevel = () => {
+      if (!analyser || !dataArray) return null;
+      analyser.getByteFrequencyData(dataArray);
+      const values = Array.from(dataArray);
+      const average = values.reduce((sum, value) => sum + value, 0) / values.length;
+      return Math.round(average);
     };
 
     startWebcam();
@@ -37,13 +58,18 @@ const WebcamStream = ({ wsRef, onFrame }) => {
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(video, 0, 0);
-      const frame = canvas.toDataURL('image/jpeg', 0.45);
-      ws.send(frame);
+      const frame = canvas.toDataURL('image/jpeg', 0.8);
+      const audioLevel = getAudioLevel();
+      const payload = JSON.stringify({ frame, audio_level_db: audioLevel });
+      ws.send(payload);
       onFrame?.(frame);
     }, 1200);
 
     return () => {
       clearInterval(interval);
+      if (audioContext) {
+        audioContext.close().catch(() => {});
+      }
       videoRef.current?.srcObject?.getTracks().forEach(t => t.stop());
     };
   }, [wsRef]);  // eslint-disable-line

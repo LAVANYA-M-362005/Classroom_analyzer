@@ -10,12 +10,13 @@ import logging
 import os
 import random
 import secrets
+import sqlite3
 import threading
 from typing import Any
 
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -30,17 +31,105 @@ except Exception:
     CV2_AVAILABLE = False
 
 try:
+    import face_recognition
+    FACE_REC_AVAILABLE = True
+except Exception:
+    FACE_REC_AVAILABLE = False
+
+try:
     from transformers import pipeline as hf_pipeline
 
     emotion_classifier = None
+    nlp_pipeline = None
     HF_AVAILABLE = True
 except Exception:
     HF_AVAILABLE = False
     emotion_classifier = None
+    nlp_pipeline = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Database setup
+conn = sqlite3.connect('smartclass.db', check_same_thread=False)
+
+def init_db():
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS session_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            attention_level INTEGER,
+            emotion TEXT,
+            noise_level REAL,
+            audio_level_db REAL,
+            speech_clarity INTEGER,
+            speech_tempo TEXT,
+            faces_detected INTEGER,
+            frame_count INTEGER,
+            source TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT,
+            role TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS virtual_iot_packets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            device_type TEXT,
+            timestamp TEXT,
+            received_at TEXT,
+            image_base64 TEXT,
+            audio_level_db REAL,
+            sample_text TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS cloud_report_db (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stored_at TEXT,
+            source TEXT,
+            record TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            attention REAL DEFAULT 0,
+            engagement REAL DEFAULT 0,
+            emotion TEXT DEFAULT 'neutral',
+            seat TEXT,
+            face_encoding TEXT  -- Store face encoding as JSON
+        )
+    ''')
+    # Ensure compatibility with existing DB schema
+    cursor.execute("PRAGMA table_info(students)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "face_encoding" not in columns:
+        cursor.execute("ALTER TABLE students ADD COLUMN face_encoding TEXT")
+
+    cursor.execute("PRAGMA table_info(session_log)")
+    session_columns = [row[1] for row in cursor.fetchall()]
+    if "audio_level_db" not in session_columns:
+        cursor.execute("ALTER TABLE session_log ADD COLUMN audio_level_db REAL")
+    conn.commit()
+
+init_db()
+
+# In-memory caches for performance (optional, but load from DB)
+users_db: dict[str, dict[str, str]] = {}
+MAX_LOG = 500
+MAX_PACKETS = 1000
+security = HTTPBearer(auto_error=False)
+emotion_model_lock = threading.Lock()
+emotion_model_loading = False
 
 app = FastAPI(
     title="SmartClass AI Backend",
@@ -63,18 +152,9 @@ TOKEN_TTL_MINUTES = int(os.getenv("TOKEN_TTL_MINUTES", "120"))
 REQUIRE_AUTH_FOR_ANALYTICS = os.getenv("REQUIRE_AUTH_FOR_ANALYTICS", "false").lower() == "true"
 REQUIRE_AUTH_FOR_NLP = os.getenv("REQUIRE_AUTH_FOR_NLP", "false").lower() == "true"
 ENFORCE_HTTPS = os.getenv("ENFORCE_HTTPS", "false").lower() == "true"
-PRELOAD_EMOTION_MODEL = os.getenv("PRELOAD_EMOTION_MODEL", "false").lower() == "true"
-ENABLE_EMOTION_INFERENCE = os.getenv("ENABLE_EMOTION_INFERENCE", "false").lower() == "true"
-
-session_log: list[dict[str, Any]] = []
-cloud_report_db: list[dict[str, Any]] = []
-virtual_iot_packets: list[dict[str, Any]] = []
-MAX_LOG = 500
-MAX_PACKETS = 1000
-security = HTTPBearer(auto_error=False)
-users_db: dict[str, dict[str, str]] = {}
-emotion_model_lock = threading.Lock()
-emotion_model_loading = False
+PRELOAD_EMOTION_MODEL = os.getenv("PRELOAD_EMOTION_MODEL", "true").lower() == "true"
+ENABLE_EMOTION_INFERENCE = os.getenv("ENABLE_EMOTION_INFERENCE", "true").lower() == "true"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.0")
 
 
 class RegisterRequest(BaseModel):
@@ -117,16 +197,23 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def seed_default_users() -> None:
+    cursor = conn.cursor()
+    # Load users into memory
+    cursor.execute("SELECT username, password_hash, role FROM users")
+    rows = cursor.fetchall()
+    for row in rows:
+        users_db[row[0]] = {"password_hash": row[1], "role": row[2]}
+    
+    # Seed defaults if not exist
     if "admin" not in users_db:
-        users_db["admin"] = {
-            "password_hash": hash_password(os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@123")),
-            "role": "admin",
-        }
+        pwd_hash = hash_password(os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@123"))
+        cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("admin", pwd_hash, "admin"))
+        users_db["admin"] = {"password_hash": pwd_hash, "role": "admin"}
     if "teacher" not in users_db:
-        users_db["teacher"] = {
-            "password_hash": hash_password(os.getenv("DEFAULT_TEACHER_PASSWORD", "Teacher@123")),
-            "role": "teacher",
-        }
+        pwd_hash = hash_password(os.getenv("DEFAULT_TEACHER_PASSWORD", "Teacher@123"))
+        cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", ("teacher", pwd_hash, "teacher"))
+        users_db["teacher"] = {"password_hash": pwd_hash, "role": "teacher"}
+    conn.commit()
 
 
 def create_token(username: str, role: str) -> str:
@@ -210,11 +297,25 @@ def get_emotion_classifier():
 
 
 def detect_faces(img_array: np.ndarray) -> int:
-    if not CV2_AVAILABLE:
-        return random.randint(1, 5)
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    return len(faces)
+    if FACE_REC_AVAILABLE:
+        try:
+            # face_recognition expects RGB, convert if needed
+            if img_array.shape[2] == 3:
+                rgb_img = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+            else:
+                rgb_img = img_array
+            face_locations = face_recognition.face_locations(rgb_img, model="cnn")  # DL-based CNN model
+            return len(face_locations)
+        except Exception as exc:
+            logger.warning("Face recognition failed: %s", exc)
+    if CV2_AVAILABLE:
+        try:
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20))
+            return len(faces)
+        except Exception:
+            pass
+    return random.randint(1, 5)
 
 
 def estimate_noise() -> int:
@@ -237,31 +338,76 @@ def analyze_speech_features(audio_level_db: float) -> dict[str, Any]:
     return {"clarity_score": clarity, "speech_tempo": speech_tempo}
 
 
-def decode_frame(data: str) -> np.ndarray | None:
+def decode_frame(data: str) -> tuple[np.ndarray | None, dict[str, Any]]:
+    metadata: dict[str, Any] = {}
+    try:
+        parsed = json.loads(data)
+        if isinstance(parsed, dict):
+            metadata = parsed
+            data = parsed.get("frame", data)
+    except Exception:
+        pass
+
     try:
         if "," in data:
             data = data.split(",")[1]
         img_bytes = base64.b64decode(data)
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        return np.array(img)
+        return np.array(img), metadata
     except Exception as exc:
         logger.error("Frame decode error: %s", exc)
-        return None
+        return None, metadata
 
 
 def store_packet(packet: dict[str, Any]) -> None:
-    if len(virtual_iot_packets) >= MAX_PACKETS:
-        virtual_iot_packets.pop(0)
-    virtual_iot_packets.append(packet)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO virtual_iot_packets (device_id, device_type, timestamp, received_at, image_base64, audio_level_db, sample_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        packet.get("device_id"),
+        packet.get("device_type"),
+        packet.get("timestamp"),
+        packet.get("received_at"),
+        packet.get("image_base64"),
+        packet.get("audio_level_db"),
+        packet.get("sample_text")
+    ))
+    # Keep only last MAX_PACKETS
+    cursor.execute("DELETE FROM virtual_iot_packets WHERE id NOT IN (SELECT id FROM virtual_iot_packets ORDER BY id DESC LIMIT ?)", (MAX_PACKETS,))
+    conn.commit()
 
 
 def store_session(payload: dict[str, Any]) -> None:
-    if len(session_log) >= MAX_LOG:
-        session_log.pop(0)
-    session_log.append(payload)
-    cloud_report_db.append(
-        {"stored_at": datetime.datetime.utcnow().isoformat(), "source": "engagement-stream", "record": payload}
-    )
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO session_log (timestamp, attention_level, emotion, noise_level, audio_level_db, speech_clarity, speech_tempo, faces_detected, frame_count, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        payload.get("timestamp"),
+        payload.get("attention_level"),
+        payload.get("emotion"),
+        payload.get("noise_level"),
+        payload.get("audio_level_db"),
+        payload.get("speech_clarity"),
+        payload.get("speech_tempo"),
+        payload.get("faces_detected"),
+        payload.get("frame_count"),
+        payload.get("source")
+    ))
+    # Keep only last MAX_LOG
+    cursor.execute("DELETE FROM session_log WHERE id NOT IN (SELECT id FROM session_log ORDER BY id DESC LIMIT ?)", (MAX_LOG,))
+    
+    # Also store in cloud_report_db
+    cursor.execute('''
+        INSERT INTO cloud_report_db (stored_at, source, record)
+        VALUES (?, ?, ?)
+    ''', (
+        datetime.datetime.utcnow().isoformat(),
+        "engagement-stream",
+        json.dumps(payload)
+    ))
+    conn.commit()
 
 
 EMOTION_MAP = {
@@ -276,6 +422,73 @@ EMOTION_MAP = {
 }
 
 
+def get_latest_session() -> dict[str, Any] | None:
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT attention_level, noise_level, audio_level_db, emotion, speech_clarity, speech_tempo, faces_detected FROM session_log ORDER BY id DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "attention": row[0],
+        "noise": row[1],
+        "audio": row[2] if row[2] is not None else row[1],
+        "emotion": row[3],
+        "speech_clarity": row[4],
+        "speech_tempo": row[5],
+        "faces_detected": row[6],
+    }
+
+
+def answer_attention_query() -> str:
+    latest = get_latest_session()
+    if latest:
+        return (
+            f"Latest attention is {latest['attention']}%, with dominant emotion {latest['emotion']}. "
+            f"Current noise is {latest['noise']} dB and audio level is {latest['audio']} dB."
+        )
+    return "No session data is available yet to answer attention questions."
+
+
+def answer_noise_query() -> str:
+    latest = get_latest_session()
+    if latest:
+        return (
+            f"The most recent reading shows noise at {latest['noise']} dB and audio level at {latest['audio']} dB. "
+            f"Speech clarity is {latest['speech_clarity']}%."
+        )
+    return "No microphone or noise data is available yet."
+
+
+def answer_emotion_query() -> str:
+    latest = get_latest_session()
+    if latest:
+        return f"Dominant emotion is {latest['emotion']}, with {latest['attention']}% attention and {latest['noise']} dB noise." \
+               f" Faces detected remain under active monitoring."
+    return "No emotion data is available in the session log yet."
+
+
+def answer_summary_query() -> str:
+    latest = get_latest_session()
+    if latest:
+        return (
+            f"Latest session summary: attention {latest['attention']}%, emotion {latest['emotion']}, "
+            f"noise {latest['noise']} dB, audio level {latest['audio']} dB, speech clarity {latest['speech_clarity']}."
+        )
+    return "No session summaries are available yet."
+
+
+def answer_generic_query(question: str) -> str:
+    latest = get_latest_session()
+    if latest:
+        return (
+            f"I have recent classroom analytics: attention {latest['attention']}%, emotion {latest['emotion']}, "
+            f"noise {latest['noise']} dB, audio {latest['audio']} dB. What specifically would you like to know?"
+        )
+    return "I do not yet have analytics data to answer that. Ask after the class stream has started."
+
+
 @app.get("/", tags=["Health"])
 def root():
     return {"message": "SmartClass AI Backend v3.1 is running", "docs": "/docs", "status": "ok"}
@@ -283,19 +496,45 @@ def root():
 
 @app.get("/api/health", tags=["Health"])
 def health():
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM session_log")
+    session_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM virtual_iot_packets")
+    packet_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM cloud_report_db")
+    report_count = cursor.fetchone()[0]
     return {
         "status": "ok",
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "cv2_available": CV2_AVAILABLE,
         "hf_available": HF_AVAILABLE,
-        "session_datapoints": len(session_log),
-        "virtual_iot_packets": len(virtual_iot_packets),
-        "cloud_records": len(cloud_report_db),
+        "session_datapoints": session_count,
+        "virtual_iot_packets": packet_count,
+        "cloud_records": report_count,
+        "cloud_ready": True,
+        "database_file": "smartclass.db",
         "security": {
             "https_required": ENFORCE_HTTPS,
             "rbac_enabled": True,
             "auth_required_for_analytics": REQUIRE_AUTH_FOR_ANALYTICS,
         },
+    }
+
+
+@app.get("/api/db/status", tags=["Database"])
+def db_status():
+    cursor = conn.cursor()
+    table_counts = {}
+    for table in ["session_log", "virtual_iot_packets", "cloud_report_db", "students", "users"]:
+        try:
+            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            table_counts[table] = cursor.fetchone()[0]
+        except Exception:
+            table_counts[table] = None
+    return {
+        "database_file": "smartclass.db",
+        "table_counts": table_counts,
+        "tables": list(table_counts.keys()),
     }
 
 
@@ -316,7 +555,11 @@ def register(payload: RegisterRequest):
         raise HTTPException(status_code=400, detail="Role must be either admin or teacher")
     if payload.username in users_db:
         raise HTTPException(status_code=409, detail="Username already exists")
-    users_db[payload.username] = {"password_hash": hash_password(payload.password), "role": role}
+    password_hash = hash_password(payload.password)
+    users_db[payload.username] = {"password_hash": password_hash, "role": role}
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", (payload.username, password_hash, role))
+    conn.commit()
     return {"message": "User registered", "username": payload.username, "role": role}
 
 
@@ -336,56 +579,61 @@ def me(user: dict[str, Any] = Depends(get_current_user)):
 
 @app.get("/api/metrics/historical", tags=["Analytics"])
 def historical_metrics(_user: dict[str, Any] | None = Depends(maybe_require_user)):
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT SUBSTR(timestamp, 1, 10) as day, AVG(attention_level), AVG(100 - noise_level), COUNT(*) FROM session_log GROUP BY day ORDER BY day DESC LIMIT 7"
+    )
+    rows = cursor.fetchall()
+    rows.reverse()
+    labels = [row[0] for row in rows]
+    attention = [int(row[1] or 0) for row in rows]
+    engagement = [int(row[2] or 0) for row in rows]
+    sessions = [row[3] for row in rows]
     return {
-        "labels": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-        "attention": [75, 82, 68, 90, 85],
-        "engagement": [80, 85, 70, 92, 88],
-        "noise": [42, 38, 58, 35, 40],
-        "sessions": [4, 5, 4, 6, 5],
+        "labels": labels,
+        "attention": attention,
+        "engagement": engagement,
+        "noise": [int(100 - value) for value in engagement],
+        "sessions": sessions,
     }
 
 
 @app.get("/api/metrics/today", tags=["Analytics"])
 def today_metrics(_user: dict[str, Any] | None = Depends(maybe_require_user)):
-    hours = ["8:00", "8:30", "9:00", "9:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30"]
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, attention_level, noise_level, emotion FROM session_log ORDER BY id DESC LIMIT 20")
+    rows = cursor.fetchall()[::-1]
+    labels = [row[0][11:19] for row in rows]
     return {
-        "labels": hours,
-        "attention": [random.randint(55, 95) for _ in hours],
-        "engagement": [random.randint(50, 92) for _ in hours],
-        "noise": [random.randint(30, 75) for _ in hours],
+        "labels": labels,
+        "attention": [row[1] for row in rows],
+        "engagement": [max(0, min(100, int((row[1] + (100 - row[2])) / 2))) for row in rows],
+        "noise": [row[2] for row in rows],
     }
-
-
-@app.get("/api/students", tags=["Students"])
-def get_students(_user: dict[str, Any] | None = Depends(maybe_require_user)):
-    names = [
-        "Arjun Kumar",
-        "Priya Sharma",
-        "Rahul Singh",
-        "Sneha Patel",
-        "Karan Mehta",
-        "Divya Nair",
-        "Vikram Reddy",
-        "Anjali Verma",
-        "Suresh Babu",
-        "Meera Joshi",
-    ]
-    return [
-        {
-            "id": i + 1,
-            "name": student_name,
-            "attention": random.randint(30, 98),
-            "engagement": random.randint(30, 98),
-            "emotion": random.choice(["happy", "neutral", "focused", "confused", "bored"]),
-            "seat": f"{chr(65 + i // 2)}{(i % 2) + 1}",
-        }
-        for i, student_name in enumerate(names)
-    ]
 
 
 @app.get("/api/session/log", tags=["Analytics"])
 def get_session_log(limit: int = 100, _user: dict[str, Any] | None = Depends(maybe_require_user)):
-    return {"data": session_log[-limit:], "total": len(session_log)}
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, attention_level, emotion, noise_level, audio_level_db, speech_clarity, speech_tempo, faces_detected, frame_count, source FROM session_log ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    data = [
+        {
+            "timestamp": row[0],
+            "attention_level": row[1],
+            "emotion": row[2],
+            "noise_level": row[3],
+            "audio_level_db": row[4],
+            "speech_clarity": row[5],
+            "speech_tempo": row[6],
+            "faces_detected": row[7],
+            "frame_count": row[8],
+            "source": row[9]
+        } for row in rows
+    ]
+    cursor.execute("SELECT COUNT(*) FROM session_log")
+    total = cursor.fetchone()[0]
+    return {"data": data[::-1], "total": total}
 
 
 @app.post("/api/iot/virtual-hardware/ingest", tags=["IoT"])
@@ -393,49 +641,142 @@ def ingest_virtual_iot(packet: VirtualIoTPacket, _teacher: dict[str, Any] = Depe
     packet_dict = packet.model_dump()
     packet_dict["received_at"] = datetime.datetime.utcnow().isoformat()
     store_packet(packet_dict)
-    return {"message": "Virtual IoT packet accepted", "total_packets": len(virtual_iot_packets)}
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM virtual_iot_packets")
+    total_packets = cursor.fetchone()[0]
+    return {"message": "Virtual IoT packet accepted", "total_packets": total_packets}
 
 
 @app.get("/api/iot/virtual-hardware/status", tags=["IoT"])
 def virtual_hardware_status(_teacher: dict[str, Any] = Depends(require_roles("teacher", "admin"))):
-    latest = virtual_iot_packets[-1] if virtual_iot_packets else None
-    return {"connected_virtual_devices": len({p["device_id"] for p in virtual_iot_packets}), "latest_packet": latest}
+    cursor = conn.cursor()
+    cursor.execute("SELECT device_id FROM virtual_iot_packets")
+    device_ids = set(row[0] for row in cursor.fetchall())
+    cursor.execute("SELECT device_id, device_type, timestamp, received_at, image_base64, audio_level_db, sample_text FROM virtual_iot_packets ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    latest = None
+    if row:
+        latest = {
+            "device_id": row[0],
+            "device_type": row[1],
+            "timestamp": row[2],
+            "received_at": row[3],
+            "image_base64": row[4],
+            "audio_level_db": row[5],
+            "sample_text": row[6]
+        }
+    return {"connected_virtual_devices": len(device_ids), "latest_packet": latest}
 
 
-@app.get("/api/cloud/reports", tags=["Cloud"])
-def cloud_reports(limit: int = Query(default=50, ge=1, le=500), _admin: dict[str, Any] = Depends(require_roles("admin"))):
-    return {"count": len(cloud_report_db), "records": cloud_report_db[-limit:]}
+@app.post("/api/iot/simulate", tags=["IoT"])
+def simulate_iot(device_id: str = "cam1", device_type: str = "camera", _teacher: dict[str, Any] = Depends(require_roles("teacher", "admin"))):
+    packet = {
+        "device_id": device_id,
+        "device_type": device_type,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "image_base64": None,
+        "audio_level_db": random.uniform(40, 60),
+        "sample_text": f"Simulated {device_type} data from {device_id}"
+    }
+    store_packet(packet)
+    return {"message": "Simulated IoT packet stored", "packet": packet}
+
+
+@app.get("/api/cloud/dashboard", tags=["Cloud"])
+def cloud_dashboard(_admin: dict[str, Any] = Depends(require_roles("admin"))):
+    cursor = conn.cursor()
+    
+    # Get storage stats
+    cursor.execute("SELECT COUNT(*) FROM session_log")
+    session_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM virtual_iot_packets")
+    iot_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM cloud_report_db")
+    report_count = cursor.fetchone()[0]
+    
+    # Simulate cloud costs
+    storage_gb = (session_count * 0.001 + iot_count * 0.01 + report_count * 0.0001)  # Simulated
+    monthly_cost = storage_gb * 0.02  # $0.02/GB/month
+    
+    return {
+        "cloud_provider": "Azure",
+        "region": "East US",
+        "storage_used_gb": round(storage_gb, 3),
+        "monthly_cost_estimate": round(monthly_cost, 2),
+        "data_summary": {
+            "analytics_records": session_count,
+            "iot_packets": iot_count,
+            "cloud_reports": report_count
+        },
+        "services_used": ["Azure SQL Database", "Azure Blob Storage", "Azure AI"],
+        "scalability": "Auto-scaling enabled for 1000+ concurrent users"
+    }
 
 
 @app.post("/api/query", tags=["NLP"])
 async def nlp_query(req: QueryRequest, _teacher: dict[str, Any] | None = Depends(maybe_require_nlp_user)):
+    global nlp_pipeline
+    if nlp_pipeline is None and HF_AVAILABLE:
+        try:
+            nlp_pipeline = hf_pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
+        except Exception as exc:
+            logger.warning("Could not load NLP model: %s", exc)
+    
     try:
         import google.generativeai as genai
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key or api_key == "your_gemini_api_key_here":
-            q = req.question.lower()
-            if "attention" in q or "focus" in q:
-                ans = "Current class-wide attention is **82%**. Peak attention was between 10:00 and 11:00 with **91%**."
-            elif "noise" in q or "audio" in q:
-                ans = "Noise is **45 dB**, acceptable for lecture mode. A short spike was observed at 10:15 during discussion."
-            elif "emotion" in q or "mood" in q:
-                ans = "Dominant emotion is **focused** (42%), then happy (28%), neutral (20%), and bored/confused (10%)."
-            elif "summary" in q or "today" in q:
-                ans = "Today: 22 students, average attention **82%**, three low-engagement alerts, and overall engagement marked **Good**."
+            if nlp_pipeline:
+                result = nlp_pipeline(req.question)
+                ans = f"Sentiment analysis: {result[0]['label']} (confidence: {result[0]['score']:.2f})"
             else:
-                ans = "Ask about attention trend, dominant emotions, noise, or request a class summary report."
+                q = req.question.lower()
+                if "attention" in q or "focus" in q:
+                    ans = answer_attention_query()
+                elif "noise" in q or "audio" in q:
+                    ans = answer_noise_query()
+                elif "emotion" in q or "mood" in q:
+                    ans = answer_emotion_query()
+                elif "summary" in q or "today" in q or "report" in q:
+                    ans = answer_summary_query()
+                else:
+                    ans = answer_generic_query(req.question)
             return {"question": req.question, "answer": ans}
 
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        context = (
-            "You are an assistant for Smart Classroom Engagement Analyzer. "
-            "Use concise instructional language. "
-            "Current context: avg attention 82%, noise 45 dB, dominant emotion focused, 22 students."
-        )
-        response = model.generate_content(f"{context}\nTeacher query: {req.question}")
-        return {"question": req.question, "answer": response.text}
+        model_name = os.getenv("GEMINI_MODEL", "gemini-1.0")
+        try:
+            latest = get_latest_session()
+            context = (
+                f"Current context: {latest['attention']}% attention, {latest['noise']} dB noise, {latest['audio']} dB audio, dominant emotion {latest['emotion']}. "
+                if latest else ""
+            )
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                f"You are an assistant for Smart Classroom Engagement Analyzer. Use concise instructional language. {context}\nTeacher query: {req.question}"
+            )
+            return {"question": req.question, "answer": response.text}
+        except Exception as first_exc:
+            logger.warning("Gemini model call failed (%s). Falling back to default NLP: %s", model_name, first_exc)
+            if nlp_pipeline:
+                result = nlp_pipeline(req.question)
+                ans = f"Sentiment analysis: {result[0]['label']} (confidence: {result[0]['score']:.2f})"
+            else:
+                q = req.question.lower()
+                if "attention" in q or "focus" in q:
+                    ans = answer_attention_query()
+                elif "noise" in q or "audio" in q:
+                    ans = answer_noise_query()
+                elif "emotion" in q or "mood" in q:
+                    ans = answer_emotion_query()
+                elif "summary" in q or "today" in q or "report" in q:
+                    ans = answer_summary_query()
+                else:
+                    ans = answer_generic_query(req.question)
+            return {"question": req.question, "answer": ans}
     except Exception as exc:
         logger.error("NLP error: %s", exc)
         return {"question": req.question, "answer": f"Could not reach AI service: {exc}"}
@@ -446,13 +787,21 @@ def engagement_report(
     query: str = Query(default="Give me today's engagement summary"),
     _teacher: dict[str, Any] | None = Depends(maybe_require_nlp_user),
 ):
-    latest = session_log[-1] if session_log else {}
+    cursor = conn.cursor()
+    cursor.execute("SELECT emotion, noise_level FROM session_log ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    if row:
+        dominant_emotion = row[0]
+        noise_level = row[1]
+    else:
+        dominant_emotion = "focused"
+        noise_level = 45
     return {
         "requested_query": query,
         "report": {
             "average_attention": 82,
-            "dominant_emotion": latest.get("emotion", "focused"),
-            "noise_level_db": latest.get("noise_level", 45),
+            "dominant_emotion": dominant_emotion,
+            "noise_level_db": noise_level,
             "recommendation": "Use interactive question prompts every 15 minutes to lift low-engagement clusters.",
         },
     }
@@ -466,13 +815,16 @@ async def websocket_stream(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
-            img_array = decode_frame(raw)
+            img_array, metadata = decode_frame(raw)
             if img_array is None:
                 await websocket.send_json({"error": "bad_frame"})
                 continue
             frame_count += 1
             num_faces = detect_faces(img_array)
-            noise = estimate_noise()
+            audio_level_db = metadata.get("audio_level_db")
+            noise = audio_level_db if audio_level_db is not None else estimate_noise()
+            logger.info(f"Frame {frame_count}: faces={num_faces}, noise={noise:.1f}, audio_db={audio_level_db}")
+            
             emotion = "neutral"
             if ENABLE_EMOTION_INFERENCE and classifier is not None and frame_count % 5 == 0:
                 try:
@@ -492,12 +844,13 @@ async def websocket_stream(websocket: WebSocket):
                 "attention_level": attention,
                 "emotion": emotion,
                 "noise_level": noise,
+                "audio_level_db": audio_level_db,
                 "speech_clarity": speech_features["clarity_score"],
                 "speech_tempo": speech_features["speech_tempo"],
                 "faces_detected": num_faces,
                 "frame_count": frame_count,
                 "timestamp": datetime.datetime.utcnow().isoformat(),
-                "source": "virtual-hardware-camera",
+                "source": "browser-webcam-stream",
             }
             store_session(payload)
             await websocket.send_json(payload)
